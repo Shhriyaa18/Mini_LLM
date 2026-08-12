@@ -1,0 +1,32 @@
+model:
+  vocab_size: 2048
+  context_len: 256
+  n_layers: 6
+  n_heads: 6
+  d_model: 384
+  d_ff: 1536
+  dropout: 0.1
+  bias: false
+  use_sdpa: true
+
+train:
+  dataset_name: code_search_net
+  dataset_config: python
+  max_train_texts: 30000
+  max_val_texts: 2000
+  val_fraction: 0.05
+  min_text_chars: 50
+  tokenizer_train_texts: 3000
+  batch_size: 32
+  max_epochs: 3
+  lr: 0.0003
+  min_lr: 0.00003
+  warmup_fraction: 0.05
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_every: 200
+  eval_batches: 50
+  log_every: 50
+  num_workers: 2
+  seed: 1337
+  amp: true
