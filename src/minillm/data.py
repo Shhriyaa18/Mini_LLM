@@ -16,9 +16,7 @@ def load_python_corpus(cfg: TrainConfig, split: str = "train") -> list[str]:
     """Pull Python functions out of CodeSearchNet."""
     from datasets import load_dataset
 
-    ds = load_dataset(
-        cfg.dataset_name, cfg.dataset_config, split=split, trust_remote_code=True
-    )
+    ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split=split)
     texts: list[str] = []
     for ex in ds:
         code = ex.get("whole_func_string") or ex.get("func_code_string") or ""

@@ -10,7 +10,7 @@ model:
   use_sdpa: true
 
 train:
-  dataset_name: code_search_net
+  dataset_name: code-search-net/code_search_net
   dataset_config: python
   max_train_texts: 30000
   max_val_texts: 2000
