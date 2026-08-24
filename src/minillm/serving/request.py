@@ -40,9 +40,20 @@ class Request:
     def num_generated(self) -> int:
         return len(self.output_ids)
 
+    
     @property
-    def position(self) -> int:
-        """Absolute position of the next token to be generated."""
+    def last_token_position(self) -> int:
+        """Position of the newest token, which is what a decode step feeds back.
+
+        The sequence is prompt_ids + output_ids, so the newest token sits at
+        index len(prompt) + len(output) - 1. Feeding it one index later rotates
+        it too far and leaves an unwritten zero row in the cache that the
+        causal mask then attends to.
+        """
+        return self.prompt_len + self.num_generated - 1
+
+    @property
+    def next_position(self) -> int:
         return self.prompt_len + self.num_generated
 
     @property

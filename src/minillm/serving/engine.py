@@ -84,7 +84,7 @@ class InferenceEngine:
             [[r.output_ids[-1]] for r in batch], dtype=torch.long, device=self.device
         )
         positions = torch.tensor(
-            [[r.position] for r in batch], dtype=torch.long, device=self.device
+                        [[r.last_token_position] for r in batch], dtype=torch.long, device=self.device
         )
         slots = torch.tensor([r.slot for r in batch], dtype=torch.long, device=self.device)
 
