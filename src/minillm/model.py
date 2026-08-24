@@ -48,17 +48,34 @@ class RotaryEmbedding(nn.Module):
         x1, x2 = x[..., :half], x[..., half:]
         return torch.cat([-x2, x1], dim=-1)
 
-    def forward(self, x: torch.Tensor, pos_offset: int = 0) -> torch.Tensor:
-        """x: (B, n_heads, T, d_head) rotated at positions [pos_offset, +T)."""
-        seq_len = x.shape[-2]
-        end = pos_offset + seq_len
-        if end > self.max_len:
-            raise ValueError(
-                f"position {end} exceeds RoPE cache length {self.max_len}"
-            )
-        cos = self.cos_cache[pos_offset:end].view(1, 1, seq_len, -1).to(x.dtype)
-        sin = self.sin_cache[pos_offset:end].view(1, 1, seq_len, -1).to(x.dtype)
-        return x * cos + self._rotate_half(x) * sin
+    def forward(
+        self,
+        x: torch.Tensor,
+        pos_offset: int = 0,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Rotate x: (B, n_heads, T, d_head).
+
+        Single-sequence decoding passes a scalar `pos_offset` and the positions
+        are the contiguous range [pos_offset, pos_offset + T). Batched serving
+        passes an explicit `positions` tensor of shape (B, T) instead, because
+        requests in a batch sit at different points in their own sequences --
+        a scalar offset cannot express that.
+        """
+        B, _, T, _ = x.shape
+        if positions is None:
+            end = pos_offset + T
+            if end > self.max_len:
+                raise ValueError(f"position {end} exceeds RoPE cache length {self.max_len}")
+            cos = self.cos_cache[pos_offset:end].view(1, 1, T, -1)
+            sin = self.sin_cache[pos_offset:end].view(1, 1, T, -1)
+        else:
+            if int(positions.max()) >= self.max_len:
+                raise ValueError("position exceeds RoPE cache length")
+            # (B, T) -> (B, T, d_head) -> (B, 1, T, d_head)
+            cos = self.cos_cache[positions].unsqueeze(1)
+            sin = self.sin_cache[positions].unsqueeze(1)
+        return x * cos.to(x.dtype) + self._rotate_half(x) * sin.to(x.dtype)
 
 
 class CausalSelfAttention(nn.Module):
@@ -90,6 +107,10 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         use_cache: bool = False,
         pos_offset: int = 0,
+        positions: Optional[torch.Tensor] = None,
+        cache=None,
+        layer_idx: int = 0,
+        slots: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, T, C = x.shape
 
@@ -100,31 +121,40 @@ class CausalSelfAttention(nn.Module):
 
         # Rotate at absolute positions before anything touches the cache: keys
         # go into the cache already rotated, so they are never re-rotated.
-        q = self.rope(q, pos_offset)
-        k = self.rope(k, pos_offset)
+        q = self.rope(q, pos_offset, positions)
+        k = self.rope(k, pos_offset, positions)
 
-        if use_cache:
-            if self.cache_k is not None:
-                k = torch.cat([self.cache_k, k], dim=2)
-                v = torch.cat([self.cache_v, v], dim=2)
-            self.cache_k, self.cache_v = k, v
-
-        T_k = k.shape[2]
-        # Query i sits at absolute position pos_offset + i; it may attend to any
-        # key at absolute position <= that.
-        mask = self.causal_mask[pos_offset : pos_offset + T, :T_k]
+        if cache is not None:
+            # Serving path: the engine owns the cache and tells us which slot
+            # each sequence lives in.
+            if positions is None:
+                raise ValueError("external cache requires explicit positions")
+            k, v = cache.append(layer_idx, slots, k, v, positions)
+            T_k = k.shape[2]
+            key_pos = torch.arange(T_k, device=x.device).view(1, 1, 1, T_k)
+            # A key index *is* its absolute position, because that is where it
+            # was written. So causality is just index <= query position.
+            mask = key_pos <= positions.view(B, 1, T, 1)
+        else:
+            if use_cache:
+                if self.cache_k is not None:
+                    k = torch.cat([self.cache_k, k], dim=2)
+                    v = torch.cat([self.cache_v, v], dim=2)
+                self.cache_k, self.cache_v = k, v
+            T_k = k.shape[2]
+            mask = self.causal_mask[pos_offset : pos_offset + T, :T_k].view(1, 1, T, T_k)
 
         if self.use_sdpa:
             out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=mask.view(1, 1, T, T_k),
+                attn_mask=mask,
                 dropout_p=self.dropout_p if self.training else 0.0,
             )
         else:
             attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
-            attn = attn.masked_fill(~mask.view(1, 1, T, T_k), float("-inf"))
+            attn = attn.masked_fill(~mask, float("-inf"))
             attn = self.attn_drop(F.softmax(attn, dim=-1))
             out = attn @ v
 
@@ -154,8 +184,12 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(cfg.d_model)
         self.ffn = SwiGLU(cfg)
 
-    def forward(self, x, use_cache: bool = False, pos_offset: int = 0):
-        x = x + self.attn(self.norm1(x), use_cache=use_cache, pos_offset=pos_offset)
+    def forward(self, x, use_cache=False, pos_offset=0, positions=None,
+                cache=None, layer_idx=0, slots=None):
+        x = x + self.attn(
+            self.norm1(x), use_cache=use_cache, pos_offset=pos_offset,
+            positions=positions, cache=cache, layer_idx=layer_idx, slots=slots,
+        )
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -206,10 +240,16 @@ class MiniLLM(nn.Module):
         targets: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         pos_offset: int = 0,
+        positions: Optional[torch.Tensor] = None,
+        cache=None,
+        slots: Optional[torch.Tensor] = None,
     ):
         x = self.drop(self.embed(idx))
-        for block in self.blocks:
-            x = block(x, use_cache=use_cache, pos_offset=pos_offset)
+        for i, block in enumerate(self.blocks):
+            x = block(
+                x, use_cache=use_cache, pos_offset=pos_offset,
+                positions=positions, cache=cache, layer_idx=i, slots=slots,
+            )
         x = self.norm(x)
         logits = self.lm_head(x)
 

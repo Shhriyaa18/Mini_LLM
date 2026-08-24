@@ -45,11 +45,7 @@ def tokenize_corpus(
 
 
 class PackedDataset(Dataset):
-    """Fixed-length windows over a flat token stream.
-
-    Packing rather than padding means no wasted compute: every position in
-    every batch is a real training target.
-    """
+     
 
     def __init__(self, tokens: np.ndarray, context_len: int):
         if len(tokens) <= context_len:
