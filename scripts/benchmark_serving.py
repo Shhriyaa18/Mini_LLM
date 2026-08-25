@@ -100,6 +100,22 @@ def summarize(name, rate, requests, stats, wall, slo) -> dict:
         "peak_fragmentation": round(stats.peak_fragmentation, 3),
     }
 
+def median_row(samples: list[dict]) -> dict:
+    """Median across repeats, plus observed spread on throughput.
+
+    Reporting spread matters more than reporting a bigger number: a result
+    quoted without it can't be checked.
+    """
+    out = dict(samples[0])
+    for key, value in samples[0].items():
+        if isinstance(value, (int, float)) and key != "arrival_rate":
+            out[key] = round(float(np.median([s[key] for s in samples])), 4)
+    tput = [s["throughput_tok_s"] for s in samples]
+    out["repeats"] = len(samples)
+    out["spread_pct"] = round(
+        100 * (max(tput) - min(tput)) / max(1e-9, np.median(tput)), 1
+    )
+    return out
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -113,6 +129,8 @@ def main() -> None:
     ap.add_argument("--out", default="benchmarks/serving.csv")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="runs per configuration; table reports medians")
     args = ap.parse_args()
 
     device = pick_device(args.device)
@@ -139,17 +157,23 @@ def main() -> None:
         print(header)
         print("-" * len(header))
         for name in ("sequential", "static", "continuous"):
-            requests = build_workload(args.requests, rate, cfg.model, seed=args.seed)
-            scheduler = SCHEDULERS[name](max_batch_size=args.batch_size)
-            engine = InferenceEngine(model, cfg.model, scheduler, device=device, temperature=0.0)
-
             import time
 
-            t0 = time.perf_counter()
-            engine.run(requests)
-            wall = time.perf_counter() - t0
+            # Thermal throttling moves throughput 20%+ across consecutive runs,
+            # which is larger than some differences one might try to explain.
+            samples = []
+            for _ in range(args.repeats):
+                requests = build_workload(args.requests, rate, cfg.model, seed=args.seed)
+                scheduler = SCHEDULERS[name](max_batch_size=args.batch_size)
+                engine = InferenceEngine(
+                    model, cfg.model, scheduler, device=device, temperature=0.0
+                )
+                t0 = time.perf_counter()
+                engine.run(requests)
+                wall = time.perf_counter() - t0
+                samples.append(summarize(name, rate, requests, engine.stats, wall, args.slo))
 
-            row = summarize(name, rate, requests, engine.stats, wall, args.slo)
+            row = median_row(samples)
             rows.append(row)
             print(
                 f"{name:<12}{rate:>6.0f}{row['throughput_tok_s']:>10.1f}"
@@ -174,6 +198,10 @@ def main() -> None:
         f"{best['throughput_tok_s']:.1f} tok/s vs {base['throughput_tok_s']:.1f} "
         f"sequential ({best['throughput_tok_s'] / base['throughput_tok_s']:.2f}x)"
     )
+
+    worst = max(r["spread_pct"] for r in rows)
+    print(f"Largest run-to-run spread: {worst:.1f}%. "
+          f"Differences smaller than this are noise, not findings.")
 
 
 if __name__ == "__main__":
